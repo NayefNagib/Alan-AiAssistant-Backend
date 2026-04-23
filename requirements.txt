@@ -1,5 +1,6 @@
 fastapi==0.136.0
 uvicorn==0.44.0
+
 python-multipart==0.0.26
 python-dotenv==1.2.2
 
@@ -12,3 +13,5 @@ google-genai==1.73.1
 
 pydantic==2.13.1
 starlette==1.0.0
+
+websockets==12.0

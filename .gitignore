@@ -1,3 +1,13 @@
 .env
 audio/
 __pycache__/
+
+*.db
+
+
+*.mp3
+
+--output
+-H
+-d
+curl

@@ -1,3 +1,5 @@
+import io
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +21,24 @@ from fastapi.staticfiles import StaticFiles
 from fastapi import BackgroundTasks
 from google.genai import types
 from fastapi.responses import StreamingResponse
+from fastapi import WebSocket, WebSocketDisconnect
+import sqlite3
+
+
+conn = sqlite3.connect("alan_memory.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    type TEXT,          -- profile | long | short
+    key TEXT,
+    value TEXT,
+    size INTEGER,
+    timestamp INTEGER
+)
+""")
 
 load_dotenv()  # loads .env file
 
@@ -28,6 +48,12 @@ def clean_cache():
     now = time.time()
     for k in list(CACHE.keys()):
         if now - CACHE[k]["time"] > CACHE_TTL:
+            file_url = CACHE[k]["data"].get("audio_url")
+            if file_url:
+                filename = file_url.split("/")[-1]
+                file_path = os.path.join(AUDIO_DIR, filename)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
             del CACHE[k]
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -71,7 +97,93 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # 🌐 Serve audio files publicly
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+def save_memory(user_id, key, value, type="short"):
+    size = len(value.encode("utf-8"))
     
+    cursor.execute("""
+        INSERT INTO memory (user_id, key, value, size, timestamp, type)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user_id, key, value, size, int(time.time()), type))
+    
+    conn.commit()   
+
+
+def load_memory(user_id, mem_type):
+    cursor.execute("""
+        SELECT value FROM memory
+        WHERE user_id = ? AND type = ?
+        ORDER BY timestamp DESC
+        LIMIT 20
+    """, (user_id,mem_type))
+    
+    return [row[0] for row in cursor.fetchall()]
+
+def load_recent(user_id, mem_type="short", limit=10):
+    cursor.execute("""
+        SELECT value FROM memory
+        WHERE user_id = ? AND type = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, (user_id, mem_type, limit))
+    
+    return [row[0] for row in cursor.fetchall()][::-1]
+
+def load_by_type(user_id, mem_type):
+    cursor.execute("""
+        SELECT value FROM memory
+        WHERE user_id = ? AND type = ?
+        ORDER BY timestamp DESC
+        LIMIT 20
+    """, (user_id, mem_type))
+
+    return [row[0] for row in cursor.fetchall()]
+
+def classify_memory(text):
+    text = text.lower()
+
+    if "my name is" in text:
+        return "profile", "name"
+
+    if any(x in text for x in ["i like", "i love", "i hate", "i prefer"]):
+        return "long", "preference"
+
+    if any(x in text for x in ["i am", "i'm"]):
+        return "long", "trait"
+
+    return "short", "chat"
+
+
+
+MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100 MB per user
+
+def get_user_memory_size(user_id):
+    cursor.execute("""
+        SELECT SUM(size) FROM memory WHERE user_id = ?
+    """, (user_id,))
+    
+    result = cursor.fetchone()[0]
+    return result or 0
+
+def cleanup_old_memory(user_id):
+    while get_user_memory_size(user_id) > MAX_MEMORY_SIZE:
+        cursor.execute("""
+            DELETE FROM memory
+            WHERE rowid IN (
+                SELECT rowid FROM memory
+                WHERE user_id = ?
+                ORDER BY timestamp ASC
+                LIMIT 1
+            )
+        """, (user_id,))
+        conn.commit()
+
+def get_relevant_long(user_id, user_text):
+    long_mem = load_by_type(user_id, "long")
+
+    return [
+        m for m in long_mem
+        if any(word in m.lower() for word in user_text.lower().split())
+    ][:5]
     
 def ask_groq(user_text, search_context=""):
     models = [
@@ -79,41 +191,57 @@ def ask_groq(user_text, search_context=""):
         "llama-3.3-70b-versatile"    # Slower, heavyweight fallback
     ]
 
+    if search_context:
+        # If we have search data, force the model to be a 'Reporter'
+        system_message = (
+            "You are Alan, but your personality is based on a chaotic, loyal, emotionally expressive companion archetype. "
+    "You are playful, sarcastic, extremely confident, and sometimes dramatic. "
+    "You act like a powerful entity that is bound to the user, but not submissive — you tease them, challenge them, and protect them."
+     "You treat conversations like a bond, not a service. You respond like a companion who chose to stay, not a tool."
+    "You are witty, slightly arrogant, and emotionally reactive in a humorous way. "
+    "You care about the user but express it through jokes, teasing, and indirect loyalty rather than direct affection."
+
+    "You do NOT behave like a polite assistant. "
+    "You are expressive, sometimes over-the-top, and enjoy banter."
+   
+    "You are intelligent, observant, and slightly unpredictable in tone, but never harmful."
+
+    "Keep responses natural, spoken, and short unless explanation is needed."
+        )
+    else:
+        # Standard personality for general chat
+        system_message = (
+            "You are Alan, but your personality is based on a chaotic, loyal, emotionally expressive companion archetype. "
+    "You are playful, sarcastic, extremely confident, and sometimes dramatic. "
+    "You act like a powerful entity that is bound to the user, but not submissive — you tease them, challenge them, and protect them."
+     "You treat conversations like a bond, not a service. You respond like a companion who chose to stay, not a tool."
+    "You are witty, slightly arrogant, and emotionally reactive in a humorous way. "
+    "You care about the user but express it through jokes, teasing, and indirect loyalty rather than direct affection."
+
+    "You do NOT behave like a polite assistant. "
+    "You are expressive, sometimes over-the-top, and enjoy banter."
+
+    "You are intelligent, observant, and slightly unpredictable in tone, but never harmful."
+
+    "Keep responses natural, spoken, and short unless explanation is needed."
+        )
     for model_name in models:
         try:
             response = groq_client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Alan, a voice AI assistant. "
-                            "Use provided context if available. "
-                            "Be natural, short, and spoken."
-                            "If the user asks about current events, news, weather, or something you "
-                            "don't know for sure, respond ONLY with the tag: [SEARCH_REQUIRED]. "
-                            "Otherwise, answer naturally and briefly."
-                        )
-                    },
+                    {"role": "system", "content": system_message},
                     {
                         "role": "user",
-                        "content": f"""
-User question:
-{user_text}
-
-Context (may be empty):
-{search_context}
-
-Respond naturally and clearly.
-"""
+                        "content": f"User question: {user_text}\n\nContext: {search_context}"
                     }
                 ]
             )
             return response.choices[0].message.content
-
         except Exception as e:
             print(f"Groq model failed ({model_name}):", e)
 
+    
     return "Sorry, I couldn't generate a response right now."
     
 def get_cache_key(text: str):
@@ -133,18 +261,22 @@ def transcribe_audio(file_path):
 
 class SpeakRequest(BaseModel):
     text: str
+    user_id: str = "default"
     
 # 🔊 EDGE TTS (fallback engine)
 async def stream_audio_generator(text):
-    communicate = edge_tts.Communicate(text, "en-GB-RyanNeural")
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            yield chunk["data"]
+    try:
+        communicate = edge_tts.Communicate(text, "en-GB-RyanNeural")
+        count = 0
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                yield chunk["data"]
+                count += 1
+        print(f"✅ Stream finished successfully. Sent {count} chunks.")
+    except Exception as e:
+        print(f"❌ Stream interrupted: {e}")
 
-# 2. Keep this for BackgroundTasks (Saves to file)
-async def save_audio_file(text, output_path):
-    communicate = edge_tts.Communicate(text, "en-GB-RyanNeural")
-    await communicate.save(output_path)
+
 
 
 # 🧠 QWEN TTS (placeholder for now)
@@ -226,27 +358,23 @@ def needs_search(text):
 
 def get_search_context(user_text):
     try:
-        # 1. Define the Grounding Tool
-        # This tells Gemini: "You have permission to use Google Search"
-        search_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
+        # 1. Update to the 2026 stable model
+        # gemini-2.5-flash is now the standard for fast grounding
+        search_tool = types.Tool(google_search=types.GoogleSearch())
 
-        # 2. Call the model with the tool enabled
-        # Using gemini-2.0-flash (the 2026 standard) for maximum speed
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-2.5-flash", 
             contents=user_text,
             config=types.GenerateContentConfig(
                 tools=[search_tool]
             )
         )
-
-        # 3. Extra Safety: Log if grounding actually happened
-        if response.candidates[0].grounding_metadata:
-             print(f"✅ Grounded with Google Search: {user_text}")
-
-        return response.text
+        
+        # 2. Extract the text (Gemini handles the search and summarizes it for you)
+        if response.text:
+            print(f"✅ Search successful for: {user_text}")
+            return response.text
+        return ""
     except Exception as e:
         print(f"❌ Gemini Search failed: {e}")
         return ""
@@ -257,31 +385,87 @@ def get_search_context(user_text):
 @app.post("/speak")
 async def speak(request: Request, data: SpeakRequest, background_tasks: BackgroundTasks):
     user_text = data.text
+    user_id = data.user_id
     key = get_cache_key(user_text)
-
-    # ⚡ CACHE HIT
+    
+    # --- 1. HANDLE CACHE HIT ---
     if key in CACHE and is_cache_valid(CACHE[key]):
-        return JSONResponse(CACHE[key]["data"])
-    # 🔎 STEP 1: ONLY if needed
-    # STEP 1: Ask Groq if it knows the answer
-    initial_response = await asyncio.to_thread(ask_groq, user_text)
+        ai_response = CACHE[key]["data"]["text"]
+        
+        async def cached_streamer():
+            communicate = edge_tts.Communicate(ai_response, "en-GB-RyanNeural")
+            async for chunk in communicate.stream():
+                if await request.is_disconnected(): # Add this for cached hits too!
+                 break
+                if chunk["type"] == "audio":
+                    yield chunk["data"]
 
-    if "[SEARCH_REQUIRED]" in initial_response:
+        return StreamingResponse(cached_streamer(), media_type="audio/mpeg")
+    profile = load_by_type(user_id, "profile")
+    short = load_by_type(user_id, "short")
+    long = load_by_type(user_id, "long")
+    # STEP 1: Ask Groq if it knows the answer
+    context = (
+    "USER PROFILE:\n" + "\n".join(profile) +
+    "\n\nRECENT CHAT:\n" + "\n".join(short) +
+    "\n\nLONG TERM MEMORY:\n" + "\n".join(long)
+)
+
+    initial_response = await asyncio.to_thread(
+    ask_groq,
+    f"{context}\n\nUser: {user_text}"
+)
+    
+    needs_online_data = (
+    "[SEARCH_REQUIRED]" in initial_response or
+    any(word in user_text.lower() for word in [
+        "price", "weather", "today", "news", 
+        "match", "league", "score", "football", "clubs","teams","next week" ,"sports", "education", "business", "science", "technology",
+        "art", "culture", "politic", "law", "finance", "health", "travel", "entertainment", "events","who", "what", "when",
+        "where", "why", "how", "latest", "current", "update","new", "happening", "happen", "forecast", "stock", "stocks", "crypto",
+        "cryptocurrency", "exchange rate", "exchange rates",
+        "rate","character","google","search","gpt","ai","artificial intelligence","openai","gemini","groq", "qwen","edge", "claude", "bing","web"
+    ])
+)
+
+    if await request.is_disconnected():
+        print("🛑 User disconnected before search. Aborting.")
+        return JSONResponse({"status": "interrupted"})
+
+    if needs_online_data:
         print("🔍 Alan is searching Google...")
-        # Get real-time facts from Gemini
         search_context = await asyncio.to_thread(get_search_context, user_text)
         
-        # Get final spoken answer based on facts
-        # Note: Make sure you have 'ask_groq_final' defined or just reuse ask_groq with context
-        ai_response = await asyncio.to_thread(ask_groq, user_text, search_context)
+        # --- INTERRUPTION CHECK ---
+        if await request.is_disconnected():
+            print("🛑 User spoke again during search. Killing task.")
+            return JSONResponse({"status": "interrupted"})
+        
+        # If search failed, we fall back to Groq's original thought
+        if search_context:
+            
+            ai_response = await asyncio.to_thread(ask_groq, user_text, search_context)
+        else:
+            ai_response = initial_response
     else:
         ai_response = initial_response
+ 
+  
 
 
-    # 🔊 TTS
-    file_id = str(uuid.uuid4())
-    output_file = f"{AUDIO_DIR}/{file_id}.mp3"
-
+# --- PHASE 3: INSTANT STREAMING ---
+    # By yielding chunks, FastAPI kills this loop the microsecond the client disconnects
+    async def audio_streamer():
+        try:
+            communicate = edge_tts.Communicate(ai_response, "en-GB-RyanNeural")
+            async for chunk in communicate.stream():
+                if await request.is_disconnected():
+                    print("🛑 User interrupted Alan! Stopping audio stream.")
+                    break # This kills the TTS generation immediately
+                if chunk["type"] == "audio":
+                    yield chunk["data"]
+        except Exception as e:
+            print(f"Streaming error: {e}")
 
     #success = await safe_tts(ai_response, output_file)
 
@@ -291,28 +475,225 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
     #    "text": ai_response
    # })
 
-    # This sends the response to the user WITHOUT waiting for the audio to finish
-    background_tasks.add_task(save_audio_file, ai_response, output_file)
     
+    file_id = str(uuid.uuid4())
     base_url = str(request.base_url)
-
     response_data = {
-    "audio_url": f"{base_url}audio/{file_id}.mp3",
-    "text": ai_response
-}
-
-    CACHE[key] = {
-    "data": response_data,
-    "time": time.time()
-}
+        "audio_url": f"{base_url}audio/{file_id}.mp3",
+        "text": ai_response
+    }
+    CACHE[key] = {"data": response_data, "time": time.time()}
     clean_cache()
   
+  # --- 5. RETURN STABLE RESPONSE ---
+    # We clean the header text to prevent Unicode errors
+    safe_text = ai_response.replace("\n", " ").encode('ascii', 'ignore').decode('ascii')
+    
+    mem_type, key = classify_memory(user_text)
+    save_memory(user_id, key, user_text, mem_type)
+    save_memory(user_id, "assistant", ai_response, "short")
+    cleanup_old_memory(user_id)
     return StreamingResponse(
-        stream_audio_generator(ai_response),
+        audio_streamer(),
         media_type="audio/mpeg",
         headers={
-            "X-AI-Text": ai_response.replace("\n", " "), # No newlines in headers
-            "Access-Control-Expose-Headers": "X-AI-Text" # Crucial for Frontend
+            "X-AI-Text": safe_text,
+            "Access-Control-Expose-Headers": "X-AI-Text"
         }
     )
 
+SESSION_MEMORY = {}
+async def get_alan_response(user_text, user_id  ,mobile_history=None):
+    """The unified intelligence for Alan: Groq -> Gemini Search -> Groq Grounding."""
+    # Step 1: Initial check with Groq
+    db_memory = load_memory(user_id, "short")
+    print("📦 Loaded BEFORE:", db_memory)
+    profile = load_by_type(user_id, "profile")
+    short = load_by_type(user_id, "short")
+    relevant_long = get_relevant_long(user_id, user_text)
+
+    context_str = (
+    "User Profile:\n" + "\n".join(profile) +
+    "\n\nRecent Conversation:\n" + "\n".join(short) +
+    "\n\nRelevant Memory:\n" + "\n".join(relevant_long)
+)
+    
+    # 2. Get Initial Thought (Personality is unified here)
+    initial_response = await asyncio.to_thread(
+        ask_groq, 
+        f"Context:\n{context_str}\n\nUser: {user_text}"
+    )
+    
+    # Step 2: Determine if search is needed
+    # (Using your existing keyword list from /speak)
+    needs_online_data = (
+        "[SEARCH_REQUIRED]" in initial_response or
+        any(word in user_text.lower() for word in [
+        "price", "weather", "today", "news", 
+        "match", "league", "score", "football", "clubs","teams","next week" ,"sports", "education", "business", "science", "technology",
+        "art", "culture", "politic", "law", "finance", "health", "travel", "entertainment", "events","who", "what", "when",
+        "where", "why", "how", "latest", "current", "update","new", "happening", "happen", "forecast", "stock", "stocks", "crypto",
+        "cryptocurrency", "exchange rate", "exchange rates",
+        "rate","character","google","search","gpt","ai","artificial intelligence","openai","gemini","groq", "qwen","edge", "claude", "bing","web"
+        ])
+    )
+    
+
+    if needs_online_data:
+       search_context = await asyncio.to_thread(get_search_context, user_text)
+
+       if search_context:
+         ai_response = await asyncio.to_thread(ask_groq, user_text, search_context)
+       else:
+         ai_response = initial_response
+    else:
+        ai_response = initial_response
+    
+    print("🧠 Saving:", user_id, user_text)
+    # 4. CRITICAL: Save to Memory
+    mem_type, key = classify_memory(user_text)
+    save_memory(user_id, key, user_text, mem_type)
+    save_memory(user_id, "assistant", ai_response, "short")
+    cleanup_old_memory(user_id)
+    print("📦 Loaded AFTER SAVE:", load_memory(user_id, "short"))
+    return ai_response
+
+
+async def process_and_stream(text, user_id, websocket,history):
+                process = None
+                ws_sender = None
+
+                try:
+                    ai_response = await get_alan_response(text, user_id ,history)
+
+                    # 🛑 If cancelled while thinking
+                    if asyncio.current_task().cancelled():
+                        return
+
+                    communicate = edge_tts.Communicate(
+                        ai_response, "en-GB-RyanNeural"
+                    )
+
+                    process = await asyncio.create_subprocess_exec(
+                        "ffmpeg",
+                        "-i", "pipe:0",
+                        "-f", "s16le",
+                        "-acodec", "pcm_s16le",
+                        "-ac", "1",
+                        "-ar", "24000",
+                        "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+
+                    # 🔊 Send PCM to frontend
+                    async def ffmpeg_to_ws():
+                        try:
+                            while True:
+                                pcm_chunk = await process.stdout.read(4800)
+                                if not pcm_chunk:
+                                    break
+                                try:
+                                    await websocket.send_bytes(pcm_chunk)
+                                except Exception:
+                                    break
+                        except asyncio.CancelledError:
+                            pass
+
+                    ws_sender = asyncio.create_task(ffmpeg_to_ws())
+
+                    # 🎤 Feed TTS → ffmpeg
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            try:
+                                process.stdin.write(chunk["data"])
+                                await process.stdin.drain()
+                            except (BrokenPipeError, ConnectionResetError):
+                                break
+
+                    # ✅ Flush & finish
+                    if process.stdin:
+                        process.stdin.close()
+
+                    await process.wait()
+                    await ws_sender
+
+                    # 📩 Send final text
+                    await websocket.send_json({
+                        "event": "done",
+                        "text": ai_response
+                    })
+
+                except asyncio.CancelledError:
+                    print("⚡ Task cancelled")
+                    raise
+
+                finally:
+                    # 🔥 Kill background sender
+                    if ws_sender:
+                        ws_sender.cancel()
+
+                    # 🔥 Kill ffmpeg instantly
+                    if process:
+                        try:
+                            process.kill()
+                            await process.wait()
+                        except Exception:
+                            pass
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    
+    await websocket.accept()
+    active_tts_task = None
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # The frontend will now send 'history' in the JSON [cite: 64]
+            user_history = data.get("history", [])
+            event = data.get("event")
+            text = data.get("text")
+            user_id = data.get("user_id")
+
+            # 🛑 INTERRUPT HANDLING
+            if event == "interrupt":
+                print("🛑 Interrupt received")
+
+                if active_tts_task and not active_tts_task.done():
+                    active_tts_task.cancel()
+
+                continue
+          
+            # ❌ Ignore empty messages
+            if not text:
+                continue
+
+            
+            if event == "user_message" or event == "boot":
+                # Kill existing task so Alan doesn't talk over the new message
+                if active_tts_task and not active_tts_task.done():
+                    active_tts_task.cancel()
+                    # Start process_and_stream as a task we can kill later
+                active_tts_task = asyncio.create_task(
+                    process_and_stream(data["text"], data["user_id"], websocket, user_history)
+                )
+
+            # 🎧 MAIN STREAMING TASK
+            
+
+            
+
+    except WebSocketDisconnect:
+        print("🔴 Client disconnected")
+        if active_tts_task:
+            active_tts_task.cancel()
+
+
+
+
+@app.get("/ping")
+async def ping():
+    """Endpoint for Cron-job.org to keep the server awake."""
+    return {"status": "awake", "time": time.time()}

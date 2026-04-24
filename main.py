@@ -23,7 +23,7 @@ from google.genai import types
 from fastapi.responses import StreamingResponse
 from fastapi import WebSocket, WebSocketDisconnect
 import sqlite3
-
+import subprocess
 
 conn = sqlite3.connect("alan_memory.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -319,16 +319,27 @@ async def upload_voice(file: UploadFile = File(...)):
     # 1. Create a unique ID and path
     file_id = str(uuid.uuid4())
     file_path = f"{AUDIO_DIR}/{file_id}_{file.filename}"
-
+    
     try:
         # 2. Write the uploaded file to disk
         with open(file_path, "wb") as f:
             content = await file.read()
             f.write(content)
+      
+        
+        converted_path = file_path.replace(".m4a", "_clean.wav")
 
+        subprocess.run([
+       "ffmpeg",
+       "-y",
+       "-i", file_path,
+       "-ar", "16000",
+       "-ac", "1",
+    converted_path
+         ])
         # 3. Transcribe (Run in thread to avoid blocking the event loop)
         # Ensure transcribe_audio is the function using Groq Whisper
-        text = await asyncio.to_thread(transcribe_audio, file_path)
+        text = await asyncio.to_thread(transcribe_audio, converted_path)
 
         return {
             "status": "success",

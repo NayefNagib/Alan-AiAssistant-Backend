@@ -693,30 +693,3 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 
-@app.get("/ping")
-async def ping():
-    """Endpoint for Cron-job.org to keep the server awake."""
-    return {"status": "awake", "time": time.time()}
-
-import subprocess
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/ffmpeg-test")
-def ffmpeg_test():
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True
-        )
-        return {
-            "available": True,
-            "output": result.stdout.split("\n")[0]
-        }
-    except Exception as e:
-        return {
-            "available": False,
-            "error": str(e)
-        }

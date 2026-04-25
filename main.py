@@ -644,6 +644,12 @@ async def process_and_stream(text, user_id, websocket,history):
                     # 🔥 Kill background sender
                     if ws_sender:
                         ws_sender.cancel()
+                
+                # 🔥 ONLY NOW it's truly done
+                    await websocket.send_json({
+                    "event": "done",
+                    "text": ai_response
+                    })
 
                     # 🔥 Kill ffmpeg instantly
                     if process:

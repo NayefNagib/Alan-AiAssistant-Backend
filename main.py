@@ -445,6 +445,7 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
 
     if needs_online_data:
         print("🔍 Alan is searching Google...")
+
         search_context = await asyncio.to_thread(get_search_context, user_text)
         
         # --- INTERRUPTION CHECK ---
@@ -514,7 +515,7 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
     )
 
 SESSION_MEMORY = {}
-async def get_alan_response(user_text, user_id  ,mobile_history=None):
+async def get_alan_response(user_text, user_id  ,mobile_history=None, websocket=None):
     """The unified intelligence for Alan: Groq -> Gemini Search -> Groq Grounding."""
     # Step 1: Initial check with Groq
     db_memory = load_memory(user_id, "short")
@@ -551,8 +552,16 @@ async def get_alan_response(user_text, user_id  ,mobile_history=None):
     
 
     if needs_online_data:
+       
+       if websocket:
+        await websocket.send_json({
+        "event": "searching"
+    })
        search_context = await asyncio.to_thread(get_search_context, user_text)
-
+       if websocket:
+        await websocket.send_json({
+            "event": "search_done"
+        })
        if search_context:
          ai_response = await asyncio.to_thread(ask_groq, user_text, search_context)
        else:
@@ -575,7 +584,10 @@ async def process_and_stream(text, user_id, websocket,history):
                 ws_sender = None
 
                 try:
-                    ai_response = await get_alan_response(text, user_id ,history)
+                    await websocket.send_json({
+    "event": "thinking"
+})
+                    ai_response = await get_alan_response(text, user_id ,history,websocket)
 
                     # 🛑 If cancelled while thinking
                     if asyncio.current_task().cancelled():

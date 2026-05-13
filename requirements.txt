@@ -15,5 +15,3 @@ pydantic==2.13.1
 starlette==1.0.0
 
 websockets>=13.0.0,<17.0
-numpy==2.3.0
-sentence-transformers==2.3.0

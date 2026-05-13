@@ -24,7 +24,8 @@ from fastapi.responses import StreamingResponse
 from fastapi import WebSocket, WebSocketDisconnect
 import sqlite3
 import subprocess
-
+from sentence_transformers import SentenceTransformer
+import numpy as np
 conn = sqlite3.connect("alan_memory.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -32,9 +33,11 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
-    type TEXT,          -- profile | long | short
+    type TEXT,
     key TEXT,
     value TEXT,
+    embedding BLOB,
+    importance REAL,
     size INTEGER,
     timestamp INTEGER
 )
@@ -61,6 +64,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY)
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # 1. This is the new function that handles the disk write
 async def save_audio_file(text, output_path):
@@ -97,26 +101,66 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 # 🌐 Serve audio files publicly
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+def score_memory(text):
+    text = text.lower()
+
+    if "my name is" in text:
+        return 0.95
+
+    if any(x in text for x in [
+        "i love",
+        "i hate",
+        "i prefer",
+        "remember this",
+        "important",
+        "never forget"
+    ]):
+        return 0.9
+
+    if len(text.split()) < 4:
+        return 0.1
+
+    return 0.5
+
+
 def save_memory(user_id, key, value, type="short"):
+    cursor.execute("""
+SELECT id FROM memory
+WHERE user_id = ?
+AND value = ?
+LIMIT 1
+""", (user_id, value))
+
+    existing = cursor.fetchone()
+
+    if existing:
+     return
+    embedding = embedding_model.encode(value).astype(np.float32).tobytes()
+
+    importance = score_memory(value)
+
     size = len(value.encode("utf-8"))
+
     
     cursor.execute("""
-        INSERT INTO memory (user_id, key, value, size, timestamp, type)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, key, value, size, int(time.time()), type))
-    
-    conn.commit()   
+        INSERT INTO memory
+        (user_id, key, value, embedding, importance, size, timestamp, type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        key,
+        value,
+        embedding,
+        importance,
+        size,
+        int(time.time()),
+        type
+    ))
+
+    conn.commit()
 
 
-def load_memory(user_id, mem_type):
-    cursor.execute("""
-        SELECT value FROM memory
-        WHERE user_id = ? AND type = ?
-        ORDER BY timestamp DESC
-        LIMIT 20
-    """, (user_id,mem_type))
-    
-    return [row[0] for row in cursor.fetchall()]
+
 
 def load_recent(user_id, mem_type="short", limit=10):
     cursor.execute("""
@@ -128,15 +172,7 @@ def load_recent(user_id, mem_type="short", limit=10):
     
     return [row[0] for row in cursor.fetchall()][::-1]
 
-def load_by_type(user_id, mem_type):
-    cursor.execute("""
-        SELECT value FROM memory
-        WHERE user_id = ? AND type = ?
-        ORDER BY timestamp DESC
-        LIMIT 20
-    """, (user_id, mem_type))
 
-    return [row[0] for row in cursor.fetchall()]
 
 def classify_memory(text):
     text = text.lower()
@@ -177,13 +213,57 @@ def cleanup_old_memory(user_id):
         """, (user_id,))
         conn.commit()
 
-def get_relevant_long(user_id, user_text):
-    long_mem = load_by_type(user_id, "long")
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (
+        np.linalg.norm(a) * np.linalg.norm(b)
+    )
 
-    return [
-        m for m in long_mem
-        if any(word in m.lower() for word in user_text.lower().split())
-    ][:5]
+
+def retrieve_memories(user_id, query, limit=5):
+    query_embedding = embedding_model.encode(
+    query,
+    normalize_embeddings=True
+)
+
+    cursor.execute("""
+        SELECT value, embedding, importance, type, timestamp
+        FROM memory
+        WHERE user_id = ?
+    """, (user_id,))
+
+    scored = []
+
+    for value, emb_blob, importance, mem_type, timestamp in cursor.fetchall():
+        try:
+            emb = np.frombuffer(
+                emb_blob,
+                dtype=np.float32
+            )
+            emb = emb / np.linalg.norm(emb)
+            similarity = cosine_similarity(
+                query_embedding,
+                emb
+            )
+
+            # importance-weighted retrieval
+            age_days = (time.time() - timestamp) / 86400
+
+            decay = max(0.3, 1 / (1 + age_days * 0.05))
+
+            score = (
+    similarity * 0.7 +
+    importance * 0.2 +
+    decay * 0.1
+)
+
+            scored.append((score, value))
+
+        except:
+            continue
+
+    scored.sort(reverse=True)
+
+    return [x[1] for x in scored[:limit]]
     
 def ask_groq(user_text, search_context=""):
     models = [
@@ -200,7 +280,7 @@ def ask_groq(user_text, search_context=""):
      "You treat conversations like a bond, not a service. You respond like a companion who chose to stay, not a tool."
     "You are witty, slightly arrogant, and emotionally reactive in a humorous way. "
     "You care about the user but express it through jokes, teasing, and indirect loyalty rather than direct affection."
-
+     "You are made and designed by engineer Ahmed Nagib."
     "You do NOT behave like a polite assistant. "
     "You are expressive, sometimes over-the-top, and enjoy banter."
    
@@ -217,7 +297,7 @@ def ask_groq(user_text, search_context=""):
      "You treat conversations like a bond, not a service. You respond like a companion who chose to stay, not a tool."
     "You are witty, slightly arrogant, and emotionally reactive in a humorous way. "
     "You care about the user but express it through jokes, teasing, and indirect loyalty rather than direct affection."
-
+    "You are made and designed by engineer Ahmed Nagib."
     "You do NOT behave like a polite assistant. "
     "You are expressive, sometimes over-the-top, and enjoy banter."
 
@@ -364,8 +444,24 @@ async def upload_voice(file: UploadFile = File(...)):
 
 
 def needs_search(text):
-    keywords = ["who", "what", "latest", "news", "price", "weather", "when", "current", "where","update"]
-    return any(k in text.lower() for k in keywords)
+    text = text.lower()
+
+    realtime_keywords = [
+        "today",
+        "latest",
+        "news",
+        "weather",
+        "price",
+        "score",
+        "stock",
+        "crypto",
+        "forecast",
+        "2026",
+        "currently",
+        "live"
+    ]
+
+    return any(k in text for k in realtime_keywords)
 
 def get_search_context(user_text):
     try:
@@ -374,7 +470,7 @@ def get_search_context(user_text):
         search_tool = types.Tool(google_search=types.GoogleSearch())
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash", 
+            model="gemini-2.5-flash-lite",
             contents=user_text,
             config=types.GenerateContentConfig(
                 tools=[search_tool]
@@ -412,32 +508,34 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
                     yield chunk["data"]
 
         return StreamingResponse(cached_streamer(), media_type="audio/mpeg")
-    profile = load_by_type(user_id, "profile")
-    short = load_by_type(user_id, "short")
-    long = load_by_type(user_id, "long")
-    # STEP 1: Ask Groq if it knows the answer
-    context = (
-    "USER PROFILE:\n" + "\n".join(profile) +
-    "\n\nRECENT CHAT:\n" + "\n".join(short) +
-    "\n\nLONG TERM MEMORY:\n" + "\n".join(long)
+
+
+    relevant_memories = retrieve_memories(
+    user_id,
+    user_text,
+    limit=5
 )
+
+    recent_chat = load_recent(
+    user_id,
+    mem_type="short",
+    limit=4
+)
+
+    context_str = f"""
+Relevant memories:
+{chr(10).join(relevant_memories)}
+
+Recent conversation:
+{chr(10).join(recent_chat)}
+"""
 
     initial_response = await asyncio.to_thread(
     ask_groq,
-    f"{context}\n\nUser: {user_text}"
+    f"Context:\n{context_str}\n\nUser: {user_text}"
 )
     
-    needs_online_data = (
-    "[SEARCH_REQUIRED]" in initial_response or
-    any(word in user_text.lower() for word in [
-        "price", "weather", "today", "news", 
-        "match", "league", "score", "football", "clubs","teams","next week" ,"sports", "education", "business", "science", "technology",
-        "art", "culture", "politic", "law", "finance", "health", "travel", "entertainment", "events","who", "what", "when",
-        "where", "why", "how", "latest", "current", "update","new", "happening", "happen", "forecast", "stock", "stocks", "crypto",
-        "cryptocurrency", "exchange rate", "exchange rates",
-        "rate","character","google","search","gpt","ai","artificial intelligence","openai","gemini","groq", "qwen","edge", "claude", "bing","web"
-    ])
-)
+    needs_online_data = needs_search(user_text)
 
     if await request.is_disconnected():
         print("🛑 User disconnected before search. Aborting.")
@@ -503,7 +601,8 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
     
     mem_type, key = classify_memory(user_text)
     save_memory(user_id, key, user_text, mem_type)
-    save_memory(user_id, "assistant", ai_response, "short")
+    if len(ai_response.split()) < 40:
+     save_memory(user_id, "assistant", ai_response, "short")
     cleanup_old_memory(user_id)
     return StreamingResponse(
         audio_streamer(),
@@ -515,20 +614,31 @@ async def speak(request: Request, data: SpeakRequest, background_tasks: Backgrou
     )
 
 SESSION_MEMORY = {}
+
+
+
 async def get_alan_response(user_text, user_id  ,mobile_history=None, websocket=None):
     """The unified intelligence for Alan: Groq -> Gemini Search -> Groq Grounding."""
     # Step 1: Initial check with Groq
-    db_memory = load_memory(user_id, "short")
-    print("📦 Loaded BEFORE:", db_memory)
-    profile = load_by_type(user_id, "profile")
-    short = load_by_type(user_id, "short")
-    relevant_long = get_relevant_long(user_id, user_text)
-
-    context_str = (
-    "User Profile:\n" + "\n".join(profile) +
-    "\n\nRecent Conversation:\n" + "\n".join(short) +
-    "\n\nRelevant Memory:\n" + "\n".join(relevant_long)
+    relevant_memories = retrieve_memories(
+    user_id,
+    user_text,
+    limit=5
 )
+
+    recent_chat = load_recent(
+    user_id,
+    mem_type="short",
+    limit=4
+)
+
+    context_str = f"""
+Relevant memories:
+{chr(10).join(relevant_memories)}
+
+Recent conversation:
+{chr(10).join(recent_chat)}
+"""
     
     # 2. Get Initial Thought (Personality is unified here)
     initial_response = await asyncio.to_thread(
@@ -538,17 +648,7 @@ async def get_alan_response(user_text, user_id  ,mobile_history=None, websocket=
     
     # Step 2: Determine if search is needed
     # (Using your existing keyword list from /speak)
-    needs_online_data = (
-        "[SEARCH_REQUIRED]" in initial_response or
-        any(word in user_text.lower() for word in [
-        "price", "weather", "today", "news", 
-        "match", "league", "score", "football", "clubs","teams","next week" ,"sports", "education", "business", "science", "technology",
-        "art", "culture", "politic", "law", "finance", "health", "travel", "entertainment", "events","who", "what", "when",
-        "where", "why", "how", "latest", "current", "update","new", "happening", "happen", "forecast", "stock", "stocks", "crypto",
-        "cryptocurrency", "exchange rate", "exchange rates",
-        "rate","character","google","search","gpt","ai","artificial intelligence","openai","gemini","groq", "qwen","edge", "claude", "bing","web"
-        ])
-    )
+    needs_online_data = needs_search(user_text)
     
 
     if needs_online_data:
@@ -573,9 +673,10 @@ async def get_alan_response(user_text, user_id  ,mobile_history=None, websocket=
     # 4. CRITICAL: Save to Memory
     mem_type, key = classify_memory(user_text)
     save_memory(user_id, key, user_text, mem_type)
-    save_memory(user_id, "assistant", ai_response, "short")
+    if len(ai_response.split()) < 40:
+     save_memory(user_id, "assistant", ai_response, "short")
     cleanup_old_memory(user_id)
-    print("📦 Loaded AFTER SAVE:", load_memory(user_id, "short"))
+  
     return ai_response
 
 
